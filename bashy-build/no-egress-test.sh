@@ -12,12 +12,8 @@
 # at the update/telemetry hosts to $BASHY_EGRESS_LOG, and aborts it. The log
 # must stay empty even though strace already asserts loopback-only traffic.
 #
-# Gateway invocation follows the pinned upstream (openclaw/openclaw v2026.10.2)
-# Dockerfile: ENTRYPOINT ["tini", "-s", "--", "node", "/app/docker-entrypoint.mjs"]
-# CMD ["node", "openclaw.mjs", "gateway"]. The entrypoint is container
-# activation (tini supervision plus `openclaw.mjs doctor --fix` before it
-# execs the CMD); this gate starts the CMD itself — `node openclaw.mjs
-# gateway` — which reads JSON5 config from the file named by
+# Gateway invocation follows the pinned upstream (openclaw/openclaw v2026.10.2):
+# `node openclaw.mjs gateway` reads JSON5 config from the file named by
 # OPENCLAW_CONFIG_PATH (default ~/.openclaw/openclaw.json), refuses to start
 # unless gateway.mode=local, binds loopback on gateway.port (default 18789),
 # and answers the /healthz liveness probe as soon as the server can answer.
@@ -25,10 +21,10 @@
 # Usage:
 #   ./bashy-build/no-egress-test.sh <gateway-dir> [run-seconds]
 #
-# In CI <gateway-dir> is the assembled runtime tree (runtime/package:
-# package/ incl. node_modules, per the upstream Dockerfile copy list),
-# installed per platform from the frozen lockfile — the gate proves that
-# tree starts with no registry access.
+# In CI <gateway-dir> is the Dockerfile-extracted runtime tree
+# (installed/package: package/ incl. node_modules), extracted per Linux
+# arch from the pinned upstream Dockerfile's built /app — the gate proves
+# that tree starts with no registry access.
 #
 # Environment (all optional):
 #   GATEWAY_ARGV        argv appended to `node openclaw.mjs` (default: gateway)
@@ -43,9 +39,8 @@
 # Fail-closed: missing strace/unshare/python3, a gateway that never comes up,
 # or a positive-control egress probe that unexpectedly succeeds all FAIL.
 #
-# Linux-only: macOS has neither unshare(1) nor strace(1), so the per-platform
-# matrix legs on macOS SKIP here (loudly, never silently) and the Linux legs
-# enforce the gate before signing (operator decision S434).
+# Linux-only: non-Linux hosts SKIP here (loudly, never silently). The
+# matrix is Linux-only, so the gate enforces on every leg before signing.
 
 set -euo pipefail
 

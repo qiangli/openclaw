@@ -11,31 +11,44 @@ UPSTREAM_SLUG=openclaw/openclaw
 UPSTREAM_TAG=v2026.10.2
 UPSTREAM_COMMIT=b8952d477f0c932d8ddc6da5c89cab5a169b6ff1
 # Toolchain kind: pnpm/Node build steps are tool-specific (build.yml next to
-# this file: frozen pnpm install + pnpm build for the build, audit gates, a
-# separate frozen pnpm --prod install, runtime-tree assembly per the upstream
-# Dockerfile copy list + prune-docker-plugin-dist, tarball of the runtime
-# tree, SBOM of the runtime tree, bundled-copy patch + tarball verify, OCI
-# image on Linux). No separate audit job.
+# this file: frozen pnpm install for the audit gates, audit gates, pinned
+# upstream Dockerfile build (unshipped base) + /app extract, SBOM of the
+# extracted tree, gate-first bundled-copy patch, re-stage of the exact
+# shipped runtime, layered shipped-image build (Dockerfile.shipped, patched
+# /app, never distributed), flatten + full-rootfs patch + single-layer
+# import, image + tarball + archive-layer vulnerable-version gates,
+# gzip-compressed docker-save image tar + digest).
+# No separate audit job.
 KIND=custom
 # Node 24 (upstream Dockerfile node:24-bookworm), pnpm 12.5.1 (upstream
 # packageManager); used by build.yml.
 NODE_VERSION=24
 PNPM_VERSION=12.5.1
 COSIGN_VERSION=v3.1.3
-# Per-platform matrix (free GitHub runners only): native modules make the
-# prod install OS/arch-specific, so each leg installs and ships its own
-# runtime tree. Asset names are openclaw-gateway-<os>-<arch>-${GITHUB_REF_NAME}.tgz.
-MATRIX="openclaw-gateway-linux-amd64=ubuntu-24.04 openclaw-gateway-linux-arm64=ubuntu-24.04-arm openclaw-gateway-darwin-arm64=macos-15 openclaw-gateway-darwin-amd64=macos-15-intel"
-# Linux host packages for the no-egress gate (that step is Linux-gated in the
-# shared skeleton; macOS legs skip the gate — see no-egress-test.sh).
+# Linux-only matrix (free GitHub runners only): each leg builds the pinned
+# upstream Dockerfile natively on its own arch, patches the extracted /app
+# tree, and ships its own arch's patched runtime as BOTH an extracted-tree
+# tarball and a gzip-compressed single-layer docker-save image tar (Docker
+# archive format, not OCI layout). Asset names are
+# openclaw-gateway-<os>-<arch>-${GITHUB_REF_NAME}.tgz / .docker.tar.gz. macOS
+# assets are DEFERRED explicitly until a valid build path exists: macOS
+# runners have no Docker daemon for the faithful Dockerfile path, and the
+# previous native pack path died on all four legs of fork build 16
+# (run 38343035125).
+MATRIX="openclaw-gateway-linux-amd64=ubuntu-24.04 openclaw-gateway-linux-arm64=ubuntu-24.04-arm"
+# Linux host packages: strace + iproute2 for the no-egress gate, curl for the
+# pinned http-cache-semantics replacement tarball. Docker is preinstalled on
+# the ubuntu runners and builds the pinned upstream Dockerfile.
 APT_PACKAGES="strace iproute2 curl"
 PRE_BUILD_GATES=""
-# The assembled runtime tree this leg built (package/ incl. node_modules);
-# the no-egress gate starts the gateway from it the way the Dockerfile
-# CMD does (`node openclaw.mjs gateway`).
-EGRESS_TARGET=runtime/package
+# The re-staged PATCHED runtime tree (re-extracted from the patched tarball
+# so it is byte-identical to what ships, staged under installed/package so
+# the tar keeps its package/ top dir); the no-egress gate starts the gateway
+# from it, i.e. from the exact patched runtime that ships in both the
+# tarball and the flattened image (same /app bytes).
+EGRESS_TARGET=installed/package
 RELEASE_EXTRA="PIN=openclaw-pin.txt audit-exceptions=audit-exceptions"
-RELEASE_ASSETS="openclaw-gateway-linux-amd64-${GITHUB_REF_NAME:-TAG}.tgz openclaw-gateway-linux-arm64-${GITHUB_REF_NAME:-TAG}.tgz openclaw-gateway-darwin-arm64-${GITHUB_REF_NAME:-TAG}.tgz openclaw-gateway-darwin-amd64-${GITHUB_REF_NAME:-TAG}.tgz openclaw-gateway-linux-amd64-sbom.cyclonedx.json openclaw-gateway-linux-arm64-sbom.cyclonedx.json openclaw-gateway-darwin-arm64-sbom.cyclonedx.json openclaw-gateway-darwin-amd64-sbom.cyclonedx.json openclaw-gateway-linux-amd64-audit-full.json openclaw-gateway-linux-arm64-audit-full.json openclaw-gateway-darwin-arm64-audit-full.json openclaw-gateway-darwin-amd64-audit-full.json openclaw-gateway-linux-amd64-image.digest openclaw-gateway-linux-arm64-image.digest openclaw-pin.txt audit-exceptions"
+RELEASE_ASSETS="openclaw-gateway-linux-amd64-${GITHUB_REF_NAME:-TAG}.tgz openclaw-gateway-linux-arm64-${GITHUB_REF_NAME:-TAG}.tgz openclaw-gateway-linux-amd64-${GITHUB_REF_NAME:-TAG}.docker.tar.gz openclaw-gateway-linux-arm64-${GITHUB_REF_NAME:-TAG}.docker.tar.gz openclaw-gateway-linux-amd64-sbom.cyclonedx.json openclaw-gateway-linux-arm64-sbom.cyclonedx.json openclaw-gateway-linux-amd64-image-sbom.cyclonedx.json openclaw-gateway-linux-arm64-image-sbom.cyclonedx.json openclaw-gateway-linux-amd64-image-grype.json openclaw-gateway-linux-arm64-image-grype.json openclaw-gateway-linux-amd64-audit-full.json openclaw-gateway-linux-arm64-audit-full.json openclaw-gateway-linux-amd64-image.digest openclaw-gateway-linux-arm64-image.digest openclaw-pin.txt audit-exceptions"
 RELEASE_EXECUTABLES=""
-RELEASE_NOTE="No tracking; OTel points only at the local collector 127.0.0.1:31415. Each gateway tarball is the Docker-runtime tree (dist + prod node_modules, symlinks kept) for its OS/arch: unpack and run with no registry access."
-RELEASE_GATES="pinned commit, frozen pnpm install + pnpm build, separate frozen pnpm prod install, pnpm audit vs reviewed exceptions, runtime-tree assembly per the upstream Dockerfile + prune-docker-plugin-dist, CycloneDX SBOM of the runtime tree, bundled http-cache-semantics patch + tarball verify, no-egress (Linux legs)."
+RELEASE_NOTE="No tracking; OTel points only at the local collector 127.0.0.1:31415. Each Linux arch ships TWO forms of the same patched runtime (pinned upstream Dockerfile's built /app, node_modules included, no http-cache-semantics < 4.3.0 in any distributed byte): an extracted-tree tarball (unpack and run node openclaw.mjs gateway from package/, no registry access) and a gzip-compressed single-layer docker-save image tar — Docker archive format, not OCI layout (docker load -i <file>, image ID + compressed-tar sha256 + size + layer count in <asset>-image.digest). macOS assets deferred until a valid build path exists."
+RELEASE_GATES="pinned commit, frozen pnpm install for the audit gates, pnpm audit vs reviewed exceptions, pinned upstream Dockerfile build (unshipped base) + /app extract, CycloneDX SBOM of the extracted tree, gate-first bundled http-cache-semantics patch, re-stage of the exact shipped runtime, layered shipped-image build with patched /app (never distributed), flatten + full-rootfs patch + single-layer import with config parity, tarball + merged-/app + archive-layer vulnerable-version gates with image/runtime diff, final flattened-/app vs signed-runtime identity, final whole-image CycloneDX SBOM and Grype high/critical vulnerability gate, gzip-compressed docker-save with digest re-verify + single-layer + 2GiB + docker-load round-trip, no-egress on the exact patched runtime."

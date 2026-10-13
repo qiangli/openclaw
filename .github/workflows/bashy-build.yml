@@ -93,11 +93,19 @@ jobs:
             runner: ubuntu-24.04
           - asset: openclaw-gateway-linux-arm64
             runner: ubuntu-24.04-arm
-          - asset: openclaw-gateway-darwin-arm64
-            runner: macos-15
-          - asset: openclaw-gateway-darwin-amd64
-            runner: macos-15-intel
     steps:
+      # Windows runners check out with core.autocrlf=true by default, which
+      # rewrites LF to CRLF in the working tree. The prepare/audit gates hash
+      # exact source bytes (e.g. src/LICENSE), so the conversion breaks the
+      # pin on Windows while linux/darwin stay green. Disable it globally
+      # BEFORE either checkout below, so both the fork scripts and the pinned
+      # source land byte-identical on every OS. The hash checks themselves are
+      # unchanged. No-op on non-Windows runners.
+      - name: disable line-ending conversion (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
       - name: checkout bashy-build
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -119,6 +127,16 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends strace iproute2 curl
+      - name: reclaim runner disk for the pinned Dockerfile build
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          df -h /
+          # Hosted runners carry toolchains and images this Linux-only build
+          # does not use. Reclaim them before pnpm and Docker write layers.
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache
+          docker system prune --all --force --volumes
+          df -h /
       - name: set up Node (NODE_VERSION, matches upstream Dockerfile base)
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
@@ -137,11 +155,9 @@ jobs:
         working-directory: src
         run: |
           # --ignore-scripts: lifecycle scripts are supply-chain surface.
-          # Only the documented build entrypoints below run, explicitly.
-          # The workspace keeps upstream's own nodeLinker (isolated, per
-          # pnpm-workspace.yaml): nothing here needs the hoisted layout now
-          # that the npm-pack path is gone — the shipped tree is assembled
-          # per the upstream Dockerfile instead (see below).
+          # This install exists ONLY as the audit gates' basis (pnpm audit
+          # below) — the shipped runtime is built by the pinned upstream
+          # Dockerfile in its own stages, never from this tree.
           pnpm install --frozen-lockfile --ignore-scripts
       - name: audit gate (a) — prod must be clean at high
         working-directory: src
@@ -177,209 +193,333 @@ jobs:
           mkdir -p "$RUNNER_TEMP/gateway-config"
           cp fork/bashy-build/openclaw-bashy.json "$RUNNER_TEMP/gateway-config/openclaw.json"
           echo "OPENCLAW_CONFIG_PATH=$RUNNER_TEMP/gateway-config/openclaw.json" >> "$GITHUB_ENV"
-      - name: build gateway dist
-        working-directory: src
-        # Native replay of the upstream Dockerfile `build` stage. Upstream
-        # runs `pnpm build:docker` + `pnpm ui:build`; `build:docker` exits 1
-        # outside Docker, while plain `pnpm build` passed in fork CI — so the
-        # native replay builds with `pnpm build && pnpm ui:build`.
-        run: pnpm build && pnpm ui:build
-      - name: install production dependencies in a separate copy
+      - name: build the pinned upstream Dockerfile (UNSHIPPED base image)
         run: |
           set -euo pipefail
-          # Native replay of the upstream Dockerfile `production-deps` stage:
-          # a SEPARATE copy holding only the install inputs, then
-          # `pnpm install --frozen-lockfile --prod`. Kept apart from src/
-          # so dev dependencies from the build install above can never leak
-          # into the shipped node_modules.
-          # Input set = the Dockerfile `dependency-inputs` stage: the root
-          # manifests, the workspace member manifests pnpm needs to resolve
-          # (packages/*, extensions/*, plus ui/ — a literal workspace member
-          # whose package.json upstream copies explicitly), patches, and the
-          # root node-*.mjs helpers. examples/ ships no manifests upstream
-          # (the Dockerfile does not copy it either). Plain cp (not cp -n):
-          # a missing input must fail here, not produce a half-resolved
-          # install. The workspace file keeps upstream's nodeLinker: isolated.
-          rm -rf prod
-          mkdir -p prod/ui prod/packages prod/patches prod/extensions
-          cp src/package.json src/pnpm-lock.yaml src/pnpm-workspace.yaml src/.npmrc prod/
-          cp src/node-*.mjs prod/
-          cp src/ui/package.json prod/ui/
-          cp -a src/packages/. prod/packages/
-          cp -a src/patches/. prod/patches/
-          cp -a src/extensions/. prod/extensions/
-          cd prod
-          # --ignore-scripts: lifecycle scripts are supply-chain surface
-          # (same rule as the build install above). Native legs build for
-          # their own OS/arch, so no --config.supportedArchitectures
-          # override: pnpm resolves for the runner it runs on, which is the
-          # platform whose tree this leg ships.
-          pnpm install --frozen-lockfile --prod --ignore-scripts
-          test -d node_modules || { echo "node_modules missing after pnpm install --prod" >&2; exit 1; }
-      - name: assemble the runtime tree (upstream Docker runtime, natively)
+          # The shipped runtime is the Dockerfile's own final stage, built
+          # here from the pinned source checkout (src/) — never reimplemented
+          # in this workflow and never fetched from a registry. The previous
+          # native pack path (package-openclaw-for-docker.mjs + a generated
+          # npm lock + npm ci) died on all four legs of fork build 16
+          # (run 38343035125): the packager's staging runs an upstream
+          # script inside the packed runtime/package tree, which lacks
+          # src/shared/non-packaged-plugin-dirs.ts. Building the official
+          # Dockerfile is the simpler faithful path the conductor directed.
+          # Each Linux leg builds natively on its own arch (amd64 on
+          # ubuntu-24.04, arm64 on ubuntu-24.04-arm); no cross-building.
+          # This base image is NEVER shipped, signed, or pushed: npm 12.x
+          # bundles a vulnerable http-cache-semantics 4.2.0
+          # (GHSA-ch52-4w7c-c8xp) that bundled deps hide from overrides, so
+          # the next steps extract its /app, patch the extracted tree, and
+          # build the SHIPPED image (Dockerfile.shipped) from the patched
+          # tree. Nothing is pushed to any registry at any point.
+          # The upstream default 8 GiB Node heap was OOM-killed on the
+          # 8 GiB proof VM. Its tsdown script documents a 4352 MiB minimum;
+          # 4608 MiB leaves headroom for native allocations and the runner.
+          mkdir -p out
+          docker build \
+            --file src/Dockerfile \
+            --build-arg OPENCLAW_EXTENSIONS="diagnostics-otel" \
+            --build-arg OPENCLAW_DOCKER_BUILD_NODE_OPTIONS="--max-old-space-size=4608" \
+            --build-arg OPENCLAW_DOCKER_BUILD_TSDOWN_MAX_OLD_SPACE_MB=4608 \
+            --tag "openclaw-gateway-base:${GITHUB_REF_NAME}" \
+            src
+      - name: extract the base /app runtime tree (pre-patch)
         run: |
           set -euo pipefail
-          # Native replay of the upstream Dockerfile `runtime-assets` stage +
-          # final-stage COPY list (see Dockerfile at the pinned tag): dist
-          # from the build above, node_modules from the separate prod
-          # install, everything else from src/.
-          RUNTIME="runtime/package"
-          rm -rf runtime
-          mkdir -p "$RUNTIME"
-          # pnpm's isolated layout is a .pnpm store of real dirs + symlinks:
-          # keep them as links (plain cp -a, NEVER --dereference —
-          # dereferencing explodes the tree and broke the linux-arm64 repro).
-          cp -a prod/node_modules "$RUNTIME/node_modules"
-          cp -a src/dist "$RUNTIME/dist"
-          cp src/package.json src/pnpm-lock.yaml src/pnpm-workspace.yaml "$RUNTIME/"
-          cp -a src/patches "$RUNTIME/patches"
-          cp src/node-version.mjs src/node-sqlite.mjs src/node-runtime-update.mjs \
-            src/node-runtime-recovery.mjs src/node-runtime-env.mjs \
-            src/cli-root-options.mjs src/gateway-run-argv.mjs src/gateway-shutdown-budget.mjs \
-            src/node-host-launcher.mjs src/node-compile-cache.mjs \
-            src/docker-entrypoint.mjs src/openclaw.mjs "$RUNTIME/"
-          cp -a src/extensions "$RUNTIME/extensions"
-          cp -a src/skills src/docs src/qa "$RUNTIME/"
-          # Upstream's `node scripts/prune-docker-plugin-dist.mjs`, the way
-          # the Dockerfile runs it (OPENCLAW_EXTENSIONS + bundled-plugin-dir
-          # env, repo root as cwd — the script resolves its root from the
-          # cwd). Its lib imports are script-relative, so the script tree is
-          # staged here only for this step and replaced by the shipped
-          # bootstrap set below. Selection matches the OCI build arg and the
-          # shipped gateway config (diagnostics-otel -> local collector).
-          cp -a src/scripts "$RUNTIME/scripts"
-          cd "$RUNTIME"
-          OPENCLAW_EXTENSIONS="diagnostics-otel" OPENCLAW_BUNDLED_PLUGIN_DIR="extensions" \
-            node scripts/prune-docker-plugin-dist.mjs
-          # Shipped scripts/ = exactly what upstream ships (Dockerfile
-          # final-stage COPY lines): package.json `files` scripts/* via
-          # copy-bootstrap-scripts.mjs, plus guard-inventory-utils.mjs.
-          node scripts/docker/copy-bootstrap-scripts.mjs ./.runtime-bootstrap
-          rm -rf ./scripts
-          mv ./.runtime-bootstrap/scripts ./scripts
-          rm -rf ./.runtime-bootstrap
-          mkdir -p scripts/lib
-          cp ../../src/scripts/lib/guard-inventory-utils.mjs scripts/lib/
-          cd ../..
-          # Dockerfile `runtime-assets` RUN tail, adapted: drop build
-          # metadata from dist, materialize the @openclaw/ai workspace link
-          # into a real dir (packages/ sources do not ship, so the link
-          # would dangle — upstream does the same copy-over), and remove the
-          # self-install links of the build.
-          find "$RUNTIME/dist" -type f \
-            \( -name '*.d.ts' -o -name '*.d.mts' -o -name '*.d.cts' -o -name '*.map' \) -delete
-          if [ -L "$RUNTIME/node_modules/@openclaw/ai" ]; then
-            ai_target="$(readlink -f "$RUNTIME/node_modules/@openclaw/ai")"
-            ai_tmp="$(mktemp -d)"
-            cp -a "$ai_target" "$ai_tmp/ai"
-            rm "$RUNTIME/node_modules/@openclaw/ai"
-            mv "$ai_tmp/ai" "$RUNTIME/node_modules/@openclaw/ai"
-            rmdir "$ai_tmp"
-          fi
-          rm -rf "$RUNTIME/node_modules/openclaw" \
-            "$RUNTIME/node_modules/.bin/openclaw" \
-            "$RUNTIME"/node_modules/.pnpm/openclaw@*/node_modules/openclaw
-          # Keep only the platform packages the selected plugins require
-          # (Dockerfile lines: required-platform-packages + the
-          # claude-agent-sdk-linux-* prune). Selection is computed with
-          # upstream's own script against the pinned source.
-          node src/scripts/lib/docker-plugin-selection.mjs src/extensions \
-            "diagnostics-otel" --required-platform-packages \
-            > "$RUNNER_TEMP/openclaw-required-platform-packages"
-          if ! grep -q '^@anthropic-ai/claude-agent-sdk-' \
-              "$RUNNER_TEMP/openclaw-required-platform-packages"; then
-            if [ -d "$RUNTIME/node_modules/@anthropic-ai" ]; then
-              find "$RUNTIME/node_modules/@anthropic-ai" -maxdepth 1 -type d \
-                -name 'claude-agent-sdk-linux-*' -exec rm -rf {} +
-            fi
-          fi
-          # Fail-closed assembly check: the tree must start the gateway
-          # (openclaw.mjs + dist + node_modules) with no further install.
-          test -f "$RUNTIME/openclaw.mjs" || { echo "missing $RUNTIME/openclaw.mjs" >&2; exit 1; }
-          test -d "$RUNTIME/dist" || { echo "missing $RUNTIME/dist" >&2; exit 1; }
-          test -d "$RUNTIME/node_modules" || { echo "missing $RUNTIME/node_modules" >&2; exit 1; }
-          test -f "$RUNTIME/package.json" || { echo "missing $RUNTIME/package.json" >&2; exit 1; }
-          test -f "$RUNTIME/pnpm-lock.yaml" || { echo "missing $RUNTIME/pnpm-lock.yaml" >&2; exit 1; }
-      - name: tar the runtime tree (per-platform signed artifact)
-        run: |
-          set -euo pipefail
-          # One tarball per matrix leg: native modules make the prod install
-          # platform-specific, so each leg ships its own tree (free GitHub
-          # runners only). Symlinks stay symlinks (no --dereference — see
-          # the assembly step). Portable tar: macOS ships bsdtar (no GNU
-          # --sort/--mtime flags), so no cross-platform bit-reproducibility
-          # is attempted here — patch_bundled.py repacks deterministically
-          # (gzip mtime=0) after the security patch.
+          # Extract the base image's /app — dist, node_modules, manifests,
+          # skills/docs — exactly as the Dockerfile built it, on this leg's
+          # native arch. The tar keeps the long-standing package/ top dir so
+          # the SBOM, patch, no-egress gate and binmgr pins keep working;
+          # EGRESS_TARGET (tool.env) still points at installed/package.
+          # No bit-reproducibility is attempted here — patch_bundled.py
+          # repacks deterministically (gzip mtime=0) after the security patch.
+          mkdir -p out
+          docker create --name openclaw-extract "openclaw-gateway-base:${GITHUB_REF_NAME}"
+          rm -rf ./runtime-app ./installed
+          docker cp openclaw-extract:/app ./runtime-app
+          docker rm openclaw-extract
+          mkdir -p installed
+          mv ./runtime-app installed/package
+          test -f installed/package/openclaw.mjs || { echo "missing installed/package/openclaw.mjs" >&2; exit 1; }
+          test -d installed/package/node_modules || { echo "node_modules missing in the Dockerfile-built /app" >&2; exit 1; }
+          test -d installed/package/dist || { echo "dist missing in the Dockerfile-built /app" >&2; exit 1; }
           TARBALL="out/${{ matrix.asset }}-${GITHUB_REF_NAME}.tgz"
-          tar -czf "$TARBALL" -C runtime package
+          tar -czf "$TARBALL" -C installed package
           ls -la "$TARBALL"
-          tar -tzf "$TARBALL" | head -n 20
-      - name: SBOM of the runtime tree (CycloneDX)
+          # Bounded listing without the SIGPIPE trap: `| head -n 20` closes
+          # the pipe early, so tar dies with 141 and `pipefail` fails a
+          # healthy build. awk prints the first 20 entries but consumes the
+          # whole listing, so tar runs to EOF (exit 0); a genuinely corrupt
+          # tarball still fails the step via pipefail.
+          tar -tzf "$TARBALL" | awk 'NR <= 20'
+      - name: unit-test the patch/gate scripts (fail fast)
+        run: |
+          set -euo pipefail
+          # The durable collateral for the GHSA-ch52-4w7c-c8xp gates runs
+          # here, before anything it guards: a broken gate script must fail
+          # the build, never silently pass it.
+          cd fork/bashy-build/scripts
+          python3 -m unittest discover -s . -p 'test_*.py'
+      - name: SBOM of the extracted runtime tree (CycloneDX)
         # Pinned anchore/sbom-action (same pin as before); it scans the
-        # assembled per-platform runtime tree, so the SBOM describes what
-        # ships. patch_bundled.py then updates it in place for the security
-        # patch (regenerating would reproduce the stale pre-patch tree,
-        # which no longer exists as a scan target once the tarball is the
-        # artifact — only the tarball is patched, not the on-disk tree).
+        # Dockerfile-built tree, so the SBOM describes what ships.
+        # patch_bundled.py then updates it in place for the security patch
+        # (regenerating would reproduce the stale pre-patch tree, which no
+        # longer exists as a scan target once only the tarball is patched).
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
-          path: ./runtime/package
+          path: ./installed/package
           format: cyclonedx-json
           output-file: out/${{ matrix.asset }}-sbom.cyclonedx.json
       - name: security patch — replace bundled http-cache-semantics <4.3.0 (GHSA-ch52-4w7c-c8xp)
         run: |
           set -euo pipefail
           # npm 12.x bundles its own http-cache-semantics 4.2.0 and bundled
-          # deps ignore overrides, so no workspace override can move the copy
-          # shipped inside the pnpm tree (in practice
-          # package/node_modules/.pnpm/npm@12.1.0/node_modules/npm/node_modules/http-cache-semantics).
-          # Patch it here, after the tarball and before signing: verify the
-          # registry dist.integrity (sha512) before use, repack
-          # deterministically, and fix the already-published SBOM in place
-          # (it must already have run — see below).
+          # deps ignore overrides, so no workspace override can move a copy
+          # shipped inside node_modules/npm. Patch it here, after the extract
+          # and before signing: verify the registry dist.integrity (sha512)
+          # before use, repack deterministically, and fix the already-published
+          # SBOM in place (it must already have run — see below).
+          # Gate-first (fail-closed both ways): --verify-only decides. When
+          # the extracted tree is already clean there is nothing to patch and
+          # the step is a loud no-op (patch_bundled.py itself REFUSES a
+          # silent no-op, so an unconditional call would fail a clean tree);
+          # when vulnerable copies remain, the patch below must clear them or
+          # the tarball gate fails the build.
           TARBALL="out/${{ matrix.asset }}-${GITHUB_REF_NAME}.tgz"
           SBOM="out/${{ matrix.asset }}-sbom.cyclonedx.json"
           test -f "$TARBALL" || { echo "missing $TARBALL" >&2; exit 1; }
           test -f "$SBOM" || { echo "missing $SBOM (SBOM step must run before this patch)" >&2; exit 1; }
-          # Pinned in the repo, never taken from the registry at build time
-          # (the registry must not be its own trust anchor). Integrity matches
-          # the upstream pnpm lockfile's resolution for http-cache-semantics@4.3.0.
-          REPLACEMENT_URL="https://registry.npmjs.org/http-cache-semantics/-/http-cache-semantics-4.3.0.tgz"
-          REPLACEMENT_INTEGRITY="sha512-M5t5LlJpS1UHMjvwRQVdFHvPISGeLAxNcrWuJkeGh0KxsqCHZ1O3NXZU/8x7cD0BDcGW8kapxMKTvwlqrNkHkA=="
-          curl -sSL --fail "$REPLACEMENT_URL" -o "${RUNNER_TEMP}/http-cache-semantics-4.3.0.tgz"
-          # Python tarfile handles the GNU LongLink/PAX entries in the tarball,
-          # and its node_modules/<pkg> match also covers pnpm's .pnpm layout.
-          python3 fork/bashy-build/scripts/patch_bundled.py \
-            --tarball "$TARBALL" \
-            --replacement "${RUNNER_TEMP}/http-cache-semantics-4.3.0.tgz" \
-            --integrity "$REPLACEMENT_INTEGRITY" \
-            --sbom "$SBOM"
-          # The SBOM is patched in place (not regenerated) on purpose: only the
-          # tarball is patched, so the on-disk runtime tree still holds the
-          # pre-patch copy and regenerating would reproduce the stale 4.2.0
-          # entry. The SBOM must describe the SHIPPED tarball — hence the
-          # in-place fix, in this order.
-      - name: security gate — no http-cache-semantics <4.3.0 in the shipped tarball
-        run: |
-          python3 fork/bashy-build/scripts/patch_bundled.py --verify-only \
-            --tarball "out/${{ matrix.asset }}-${GITHUB_REF_NAME}.tgz"
-      - name: build gateway OCI image (pinned upstream Dockerfile)
-        # Linux only: macOS runners have no Docker daemon, and the signed
-        # per-platform artifacts are the runtime-tree tarballs above. The
-        # image still builds on both Linux legs (one digest per leg).
-        if: runner.os == 'Linux'
+          if python3 fork/bashy-build/scripts/patch_bundled.py --verify-only \
+            --tarball "$TARBALL"; then
+            echo "security patch: tree already holds no http-cache-semantics < 4.3.0 — no-op (gate still enforced below)"
+          else
+            # Pinned in the repo, never taken from the registry at build time
+            # (the registry must not be its own trust anchor). Integrity matches
+            # the upstream pnpm lockfile's resolution for http-cache-semantics@4.3.0.
+            REPLACEMENT_URL="https://registry.npmjs.org/http-cache-semantics/-/http-cache-semantics-4.3.0.tgz"
+            REPLACEMENT_INTEGRITY="sha512-M5t5LlJpS1UHMjvwRQVdFHvPISGeLAxNcrWuJkeGh0KxsqCHZ1O3NXZU/8x7cD0BDcGW8kapxMKTvwlqrNkHkA=="
+            curl -sSL --fail "$REPLACEMENT_URL" -o "${RUNNER_TEMP}/http-cache-semantics-4.3.0.tgz"
+            # Python tarfile handles the GNU LongLink/PAX entries in the tarball.
+            python3 fork/bashy-build/scripts/patch_bundled.py \
+              --tarball "$TARBALL" \
+              --replacement "${RUNNER_TEMP}/http-cache-semantics-4.3.0.tgz" \
+              --integrity "$REPLACEMENT_INTEGRITY" \
+              --sbom "$SBOM"
+            # The SBOM is patched in place (not regenerated) on purpose: only the
+            # tarball is patched, so the on-disk installed tree still holds the
+            # pre-patch copy and regenerating would reproduce the stale 4.2.0
+            # entry. The SBOM must describe the SHIPPED tarball — hence the
+            # in-place fix, in this order.
+          fi
+      - name: re-stage the exact shipped runtime + tarball gate
         run: |
           set -euo pipefail
+          # The tarball (patched when it needed it) is a signed artifact. Put
+          # its exact bytes back on disk: from here on, installed/package IS
+          # the shipped runtime — the tree the shipped image is COPYed from
+          # below AND the tree the skeleton's no-egress gate starts after all
+          # build steps. Re-extract (never hand-sync) so drift is impossible.
+          TARBALL="out/${{ matrix.asset }}-${GITHUB_REF_NAME}.tgz"
+          rm -rf installed/package
+          mkdir -p installed
+          tar -xzf "$TARBALL" -C installed
+          test -f installed/package/openclaw.mjs || { echo "missing installed/package/openclaw.mjs after re-stage" >&2; exit 1; }
+          test -d installed/package/node_modules || { echo "node_modules missing after re-stage" >&2; exit 1; }
+          test -d installed/package/dist || { echo "dist missing after re-stage" >&2; exit 1; }
+          # Tarball gate: no http-cache-semantics <4.3.0 in the shipped tarball.
+          python3 fork/bashy-build/scripts/patch_bundled.py --verify-only \
+            --tarball "$TARBALL"
+      - name: build the layered shipped image (patched /app, NOT distributed)
+        run: |
+          set -euo pipefail
+          # fork/bashy-build/Dockerfile.shipped is FROM the unshipped base
+          # image with the re-staged patched tree COPYed over /app — nothing
+          # else changes, no network touched (COPY is from the local build
+          # context). This LAYERED image is NEVER distributed: its lower
+          # layers still carry the base's vulnerable bundled copy, and
+          # `docker save` ships every layer. It exists only as the merge
+          # view (patched /app wins) that the flatten step exports, and as
+          # the runtime-config source the flattened image inherits.
           docker build \
-            --file src/Dockerfile \
-            --build-arg OPENCLAW_EXTENSIONS="diagnostics-otel" \
-            --tag "openclaw-gateway:${GITHUB_REF_NAME}" \
-            src
-          docker inspect "openclaw-gateway:${GITHUB_REF_NAME}" \
-            --format='{{.Id}}' > "out/${{ matrix.asset }}-image.digest"
-          cat "out/${{ matrix.asset }}-image.digest"
+            --file fork/bashy-build/Dockerfile.shipped \
+            --build-arg "BASE_IMAGE=openclaw-gateway-base:${GITHUB_REF_NAME}" \
+            --tag "openclaw-gateway-layered:${GITHUB_REF_NAME}" \
+            installed
+      - name: image gate — the layered image's merged /app holds no http-cache-semantics <4.3.0
+        run: |
+          set -euo pipefail
+          # Prove the LAYERED image's merged /app (not just the tarball) is
+          # patched: copy /app back out of a fresh container from the layered
+          # image and run the same vulnerable-version gate over it. Then
+          # prove the image's /app IS the shipped runtime: diff -r against
+          # installed/package (content compare; COPY preserves content).
+          # Both fail closed. NOTE: this gate sees the MERGED view only — it
+          # cannot see the vulnerable copy surviving in the lower layers, so
+          # the archive gate below (over the saved flattened image) is what
+          # proves the DISTRIBUTED bytes clean.
+          docker create --name openclaw-verify "openclaw-gateway-layered:${GITHUB_REF_NAME}"
+          rm -rf ./image-app
+          docker cp openclaw-verify:/app ./image-app
+          docker rm openclaw-verify
+          test -f image-app/openclaw.mjs || { echo "missing image-app/openclaw.mjs in the shipped image" >&2; exit 1; }
+          test -d image-app/node_modules || { echo "node_modules missing in the shipped image" >&2; exit 1; }
+          test -d image-app/dist || { echo "dist missing in the shipped image" >&2; exit 1; }
+          diff -r installed/package image-app
+          echo "image gate: shipped image /app is identical to the shipped runtime tree"
+          rm -f "${RUNNER_TEMP}/image-app.tgz"
+          tar -czf "${RUNNER_TEMP}/image-app.tgz" -C . image-app
+          python3 fork/bashy-build/scripts/patch_bundled.py --verify-only \
+            --tarball "${RUNNER_TEMP}/image-app.tgz"
+          rm -rf image-app "${RUNNER_TEMP}/image-app.tgz"
+      - name: flatten + patch the full rootfs + import the distributable image
+        run: |
+          set -euo pipefail
+          # The DISTRIBUTED image is a single-layer flattening of the layered
+          # image's merged view: `docker export` cannot carry lower layers,
+          # so the base's vulnerable bundled copy physically cannot survive
+          # in the distributed bytes. patch_rootfs.py (inside
+          # flatten-image.sh, gate-first) additionally replaces every
+          # vulnerable copy in the WHOLE rootfs — including copies OUTSIDE
+          # /app such as the Node base's own npm tree — with the pinned
+          # fixed release. Runtime config is inherited from the layered
+          # image (verified identical by the script's parity check).
+          # The replacement tarball was downloaded by the security-patch step
+          # above when /app needed it; fetch it here when that step was a
+          # no-op but the base npm tree still needs it (integrity is enforced
+          # by patch_rootfs.py on use, never by this download).
+          REPLACEMENT_TGZ="${RUNNER_TEMP}/http-cache-semantics-4.3.0.tgz"
+          if [[ ! -f $REPLACEMENT_TGZ ]]; then
+            curl -sSL --fail \
+              "https://registry.npmjs.org/http-cache-semantics/-/http-cache-semantics-4.3.0.tgz" \
+              -o "$REPLACEMENT_TGZ"
+          fi
+          chmod +x fork/bashy-build/flatten-image.sh
+          SOURCE_IMAGE="openclaw-gateway-layered:${GITHUB_REF_NAME}" \
+            TARGET_IMAGE="openclaw-gateway:${GITHUB_REF_NAME}" \
+            WORK_DIR="${RUNNER_TEMP}/flat" \
+            REPLACEMENT_TGZ="$REPLACEMENT_TGZ" \
+            REPLACEMENT_INTEGRITY="sha512-M5t5LlJpS1UHMjvwRQVdFHvPISGeLAxNcrWuJkeGh0KxsqCHZ1O3NXZU/8x7cD0BDcGW8kapxMKTvwlqrNkHkA==" \
+            SCRIPTS_DIR="fork/bashy-build/scripts" \
+            fork/bashy-build/flatten-image.sh
+      - name: final image identity gate — flattened /app equals signed runtime tree
+        run: |
+          set -euo pipefail
+          # The full-rootfs patch runs after the layered-image comparison.
+          # Verify its final output too: the image we distribute must carry
+          # exactly the /app bytes in the separately signed runtime tarball.
+          docker create --name openclaw-final-verify "openclaw-gateway:${GITHUB_REF_NAME}"
+          rm -rf ./final-image-app
+          docker cp openclaw-final-verify:/app ./final-image-app
+          docker rm openclaw-final-verify
+          diff -r installed/package final-image-app
+          echo "final image identity gate: flattened /app equals signed runtime tree"
+          # The import has consumed these temporary copies. Reclaim them
+          # before docker save writes the release archive on the same runner.
+          rm -rf final-image-app "${RUNNER_TEMP}/flat"
+      - name: SBOM of the final whole image (OS and application)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: openclaw-gateway:${{ github.ref_name }}
+          format: cyclonedx-json
+          output-file: out/${{ matrix.asset }}-image-sbom.cyclonedx.json
+      - name: install cosign for verified Grype installation (pinned; must equal PIN COSIGN_VERSION)
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: whole-image vulnerability gate (high and critical)
+        run: |
+          set -euo pipefail
+          # Grype reads the local final image, including Debian and Node
+          # packages. Its JSON report is signed with the other release assets.
+          # No exceptions or waivers: findings at high or above stop release.
+          # Grype installer provenance (reviewed 2026-10-13): install.sh for
+          # the pinned v0.120.1 release, fetched from the exact published
+          # source https://raw.githubusercontent.com/anchore/grype/v0.120.1/install.sh
+          # (24892 bytes, sha256 4bc8e844d1ca0b74082cb51e1587d58c35150756954660db3d3078e57c81cbfd,
+          # corroborated by two independent fetches). A tag in the URL alone
+          # is not authentication: the file is verified by hash BEFORE
+          # execution, and DOWNLOAD_TAG_INSTALL_SCRIPT=false keeps the
+          # verified script from re-fetching an unverified copy of itself.
+          mkdir -p "${RUNNER_TEMP}/bin"
+          GRYPE_INSTALL_SH="${RUNNER_TEMP}/grype-install-v0.120.1.sh"
+          curl -fsSL https://raw.githubusercontent.com/anchore/grype/v0.120.1/install.sh \
+            -o "$GRYPE_INSTALL_SH"
+          echo "4bc8e844d1ca0b74082cb51e1587d58c35150756954660db3d3078e57c81cbfd  $GRYPE_INSTALL_SH" \
+            | sha256sum -c -
+          DOWNLOAD_TAG_INSTALL_SCRIPT=false \
+            sh "$GRYPE_INSTALL_SH" -v v0.120.1 -b "${RUNNER_TEMP}/bin"
+          GRYPE_CHECK_FOR_APP_UPDATE=false \
+            "${RUNNER_TEMP}/bin/grype" \
+            "docker:openclaw-gateway:${GITHUB_REF_NAME}" \
+            --fail-on high -o json > "out/${{ matrix.asset }}-image-grype.json"
+      - name: save the distributable image + archive gate + digest
+        run: |
+          set -euo pipefail
+          # The distributable artifact: the FLATTENED single-layer image's
+          # `docker save` output piped through deterministic gzip (`gzip -n`,
+          # no name/timestamp in the header so the bytes are reproducible),
+          # named *.docker.tar.gz. Compression is REQUIRED, not cosmetic:
+          # the single-layer save holds the whole rootfs (2.9 GiB
+          # uncompressed at the pin) and hard-fails the 2 GiB release-file
+          # limit uncompressed. NOTE on format: `docker save` writes the
+          # Docker archive format (manifest.json + layer tars), NOT an OCI
+          # layout — the asset is that same archive gzip-compressed; load it
+          # with `docker load -i <file>` (the daemon sniffs the compression).
+          # No registry, nothing pushed anywhere.
+          # The digest file binds the flattened image ID to the COMPRESSED
+          # tarball's sha256 (+ compressed byte size and layer count); the
+          # skeleton signs every release asset, so digest and cosign
+          # signature both bind the exact compressed bytes the archive gate
+          # checked below — verifiable against the workflow identity.
+          mkdir -p out
+          IMAGE_TAR="out/${{ matrix.asset }}-${GITHUB_REF_NAME}.docker.tar.gz"
+          DIGEST="out/${{ matrix.asset }}-image.digest"
+          IMAGE_ID="$(docker inspect "openclaw-gateway:${GITHUB_REF_NAME}" --format='{{.Id}}')"
+          docker save "openclaw-gateway:${GITHUB_REF_NAME}" | gzip -n > "$IMAGE_TAR"
+          SHA="$(sha256sum "$IMAGE_TAR" | awk '{print $1}')"
+          BYTES="$(wc -c <"$IMAGE_TAR")"
+          # Layer-wide vulnerable-copy gate over the EXACT DISTRIBUTED bytes
+          # (fails the build on any http-cache-semantics < 4.3.0 in ANY
+          # layer, anywhere in the filesystem — this is the gate the
+          # lower-layer leak needs; it transparently decompresses the .gz
+          # and also enforces the 2 GiB size limit, all before signing).
+          python3 fork/bashy-build/scripts/gate_image_archive.py --archive "$IMAGE_TAR"
+          LAYERS="$(python3 -c 'import json,sys,tarfile; print(len(json.load(tarfile.open(sys.argv[1], "r:*").extractfile("manifest.json"))[0]["Layers"]))' "$IMAGE_TAR")"
+          {
+            echo "image: openclaw-gateway:${GITHUB_REF_NAME}"
+            echo "image_id: $IMAGE_ID"
+            echo "image_tar: $(basename "$IMAGE_TAR")"
+            echo "format: gzip-compressed docker-save (Docker archive format, not OCI layout; load with docker load -i)"
+            echo "sha256:$SHA"
+            echo "bytes: $BYTES"
+            echo "layers: $LAYERS"
+          } > "$DIGEST"
+          cat "$DIGEST"
+          # Fail-closed self-checks before upload: the digest must re-verify
+          # (catches truncation); the flattened image must be single-layer
+          # (proves no lower layer can smuggle the vulnerable copy); the
+          # COMPRESSED tarball must round-trip through `docker load` back to
+          # the same image ID (proves the distributed file itself loads).
+          # The archive gate above already proved the distributed bytes hold
+          # no vulnerable copy in any layer and fit the release limit.
+          test "$(sha256sum < "$IMAGE_TAR" | awk '{print $1}')" = "$SHA" \
+            || { echo "digest re-verify failed for $IMAGE_TAR" >&2; exit 1; }
+          test "$LAYERS" = "1" \
+            || { echo "$IMAGE_TAR has $LAYERS layers, expected 1 (not flattened?)" >&2; exit 1; }
+          # GitHub releases refuse files >= 2 GiB; fail here with a message
+          # instead of a late release-upload error (belt-and-braces beside
+          # the gate script's own --max-bytes enforcement, measured here on
+          # the same compressed bytes that ship).
+          test "$BYTES" -lt 2147483648 \
+            || { echo "$IMAGE_TAR is $BYTES bytes (>= 2 GiB release limit)" >&2; exit 1; }
+          docker load -i "$IMAGE_TAR"
+          test "$(docker inspect "openclaw-gateway:${GITHUB_REF_NAME}" --format='{{.Id}}')" = "$IMAGE_ID" \
+            || { echo "round-tripped image ID mismatch" >&2; exit 1; }
+          echo "image self-checks passed: archive gate clean, single layer, digest re-verifies, compressed tarball docker-loads to $IMAGE_ID"
       - name: no-egress gate (before signing)
-        run: fork/bashy-build/no-egress-test.sh "runtime/package"
+        run: fork/bashy-build/no-egress-test.sh "installed/package"
 
       - name: upload unsigned build outputs
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
